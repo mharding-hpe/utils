@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2020-2023 Hewlett Packard Enterprise Development LP
+# Copyright 2020-2024 Hewlett Packard Enterprise Development LP
 #
 # The ncnHealthChecks script executes a number of NCN system health checks:
 #    Report Kubernetes status for Master and worker nodes
@@ -491,20 +491,60 @@ node_pod_counts() {
     echo
 }
 
+print_warning() {
+    local msg
+    msg="$*"
+    echo " --- WARNING --- ${msg}"
+    failureMsg="${failureMsg}\nWARNING: ${msg}"
+    # this is a warning, not a failure, so do not update $exit_code
+}
+
 pods_not_running() {
+    local lines tmpfile msg grep_regex grok_pod grok_regex x
     echo "**************************************************************************"
     echo
     echo "=== Pods yet to reach the running state: ==="
-    echo "=== kubectl get pods -A -o wide | grep -v \"Completed\|Running\" ==="
-    date
-    kubectl get pods -A -o wide | grep -v "Completed\|Running"
-    lines=$(kubectl get pods -A -o wide | grep -v "Completed\|Running" | wc -l)
-    if [[ $lines -gt 1 ]]
-    then
-        echo " --- WARNING --- not all pods are in a 'Running' or 'Completed' state.";
-        failureMsg="${failureMsg}\nWARNING: not all pods are in a 'Running' or 'Completed' state."
-        # this is a warning, exits with code=0
-    else echo " --- PASSED ---"; fi
+    # Run a loop so we can break out of it to exit the function, to simplify some logic
+    for x in 1 ; do
+        tmpfile=$(mktemp) || {
+            print_warning "unable to create temporary file; cannot check pod status." ; break
+        }
+
+        grep_regex="Completed|Running"
+        # CASMTRIAGE-6662: If running on a PIT node, ignore Pending
+        # cray-sysmgmt-health-grok-exporter pods        
+        grok_pod="cray-sysmgmt-health-grok-exporter"
+        grok_regex="${grok_pod}-.* Pending"
+        [[ -e /etc/pit-release ]] && grep_regex+="|${grok_regex}"
+        grep_regex=" (${grep_regex}) "
+
+        echo "=== kubectl get pods -A -o wide | grep -Ev \"${grep_regex}\" ==="
+        date
+        kubectl get pods -A -o wide | grep -Ev "${grep_regex}" | tee "${tmpfile}"
+        lines=$(wc -l "${tmpfile}" | awk '{ print $1 }')
+        [[ $lines -le 1 ]] && echo " --- PASSED ---" && break
+
+        print_warning "not all pods are in a 'Running' or 'Completed' state."
+
+        # In theory when the PIT node is around, this script should always be run from
+        # it. But it's possible someone ran it from a different NCN. So we will also
+        # just mention here that IF there is still a PIT node, then Pending
+        # cray-sysmgmt-health-grok-exporter pods can be ignored
+
+        # If this is the PIT node, then we've already filtered out those pods, so we're done
+        [[ -e /etc/pit-release ]] && break
+    
+        # If this is ncn-m001, then we know there is no PIT node around
+        [[ $(hostname -s) == "ncn-m001" ]] && break
+
+        # If there are no Pending grok-exporter pods, we're done
+        grep -Eq " ${grok_regex} " "${tmpfile}" || break
+
+        # There are Pending grok-exporter pods, and it's possible there's still a PIT node, so
+        # tell the user that they can ignore this if there is still a PIT node.
+        echo "NOTE: If ncn-m001 is still the PIT, then Pending ${grok_pod}" \
+             "pods are expected and should be ignored"
+    done
     echo
 }
 
